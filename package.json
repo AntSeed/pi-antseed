@@ -1,0 +1,27 @@
+{
+  "name": "pi-antseed",
+  "version": "0.1.0",
+  "description": "Use the AntSeed local buyer proxy as a model provider in pi.",
+  "private": true,
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "antseed",
+    "p2p",
+    "proxy",
+    "openai-compatible"
+  ],
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/antseed.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
