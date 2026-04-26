@@ -1,6 +1,6 @@
 # pi-antseed
 
-Use [AntSeed](https://antseed.ai) as a model provider in [pi](https://shittycodingagent.ai).
+Use [AntSeed](https://antseed.com) as a model provider in [pi](https://shittycodingagent.ai).
 
 AntSeed runs a **local buyer proxy** (default `http://localhost:8377/v1`) that
 speaks Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses
