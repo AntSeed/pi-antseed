@@ -38,11 +38,18 @@ which is what this extension needs.
 ### 1. Install AntSeed
 
 ```bash
-npm i -g antseed
+npm i -g @antseed/cli
 antseed --version
 ```
 
-Identity / state lives in `~/.antseed/`.
+The published package is [`@antseed/cli`](https://www.npmjs.com/package/@antseed/cli);
+it installs the `antseed` binary. Identity / state lives in `~/.antseed/`.
+
+First-time setup:
+
+```bash
+antseed seller setup   # creates ~/.antseed/config.json
+```
 
 ### 2. Fund the buyer wallet
 
