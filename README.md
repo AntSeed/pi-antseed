@@ -3,9 +3,12 @@
 Use [AntSeed](https://antseed.ai) as a model provider in [pi](https://shittycodingagent.ai).
 
 AntSeed runs a **local buyer proxy** (default `http://localhost:8377/v1`) that
-speaks the OpenAI Chat Completions API. This package registers that proxy as a
-pi provider called `antseed`, so you can switch to AntSeed-routed models with
-`/model antseed/<id>`.
+speaks Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses
+interchangeably — the [`@antseed/api-adapter`](https://github.com/AntSeed/antseed/tree/main/packages/api-adapter)
+translates between them on the fly, regardless of what the upstream seller
+actually speaks. This package registers the proxy as a pi provider called
+`antseed` (using OpenAI Chat Completions), so you can switch to AntSeed-routed
+models with `/model antseed/<id>`.
 
 ---
 
@@ -172,8 +175,6 @@ ANTSEED_MODELS="minimax-m2.7,minimax-m2.7-highspeed" pi
 
 ## Troubleshooting
 
-- **`502 Bad Gateway` on `/v1/messages`** — expected; the proxy speaks Chat
-  Completions, not the Anthropic API. pi uses `openai-completions` here.
 - **Empty `/v1/models`** — no peer is connected. Pin one with
   `antseed buyer connection set --peer <id>`, or start the proxy with
   `--router <name>`.
@@ -183,6 +184,9 @@ ANTSEED_MODELS="minimax-m2.7,minimax-m2.7-highspeed" pi
   via `antseed payments`.
 - **Identity errors** — make sure `ANTSEED_IDENTITY_HEX` is exported in the
   shell that runs `antseed buyer start`.
+- **5xx from the proxy on a real request** — usually means the pinned peer
+  doesn't offer the model you asked for, or has gone offline. Re-run
+  `antseed network browse --services` and pick another peer.
 
 ---
 
@@ -193,3 +197,9 @@ ANTSEED_MODELS="minimax-m2.7,minimax-m2.7-highspeed" pi
 AntSeed buyer proxy. Pi then treats AntSeed like any other OpenAI-compatible
 provider; AntSeed handles peer selection, payment channels, and metering on its
 side.
+
+We pick OpenAI Chat Completions because it's the hub format inside
+`@antseed/api-adapter` — every supported protocol routes through it, so
+pointing pi at `/v1/chat/completions` is the most direct path. The same proxy
+will happily serve `/v1/messages` (Anthropic) or `/v1/responses` (OpenAI
+Responses) for other tools that prefer those shapes.
