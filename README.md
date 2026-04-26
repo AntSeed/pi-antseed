@@ -154,8 +154,13 @@ peer's services.
 /model antseed/minimax-m2.7
 ```
 
-MiniMax M2.7 is an open-weights model — preferred default for this package.
-If `/v1/models` returns IDs not in the built-in list, set `ANTSEED_MODELS`:
+MiniMax M2.7 is an open-weights model — a good default. The model list is
+discovered live from the pinned peer's `/v1/models`, so whatever that peer
+advertises shows up under `antseed/...` automatically. After changing peers
+with `antseed buyer connection set --peer <id>`, run `/reload` in pi to refresh.
+
+If you want to bypass discovery (offline, or to register a specific subset),
+set `ANTSEED_MODELS`:
 
 ```bash
 ANTSEED_MODELS="minimax-m2.7,minimax-m2.7-highspeed" pi
@@ -169,7 +174,7 @@ ANTSEED_MODELS="minimax-m2.7,minimax-m2.7-highspeed" pi
 | ------------------ | --------------------------------- | --------------------------------------------------------- |
 | `ANTSEED_BASE_URL` | `http://localhost:8377/v1`        | Override the buyer proxy URL.                             |
 | `ANTSEED_API_KEY`  | _(unset)_                         | Only needed if you front the proxy with auth.            |
-| `ANTSEED_MODELS`   | _(built-in list)_                 | Comma-separated model IDs to register, overrides default. |
+| `ANTSEED_MODELS`   | _(discovered from `/v1/models`)_  | Comma-separated model IDs to register, skips discovery.   |
 
 ---
 
