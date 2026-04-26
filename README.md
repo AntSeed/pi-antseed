@@ -104,11 +104,13 @@ antseed network browse --services            # one row per (peer, service)
 antseed network browse --sort price --top 10
 ```
 
-Inspect a specific peer:
+Inspect a specific peer (full details — providers, services, on-chain stats):
 
 ```bash
-antseed peer <peerId>
+antseed network peer 0e49122e76bd8b9ccb2fe10c0088c41ceb608927
 ```
+
+(`antseed peer <peerId>` also exists for a quick profile-only view.)
 
 ### 6. Connect to that peer
 
