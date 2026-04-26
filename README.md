@@ -35,91 +35,115 @@ Restart pi (or `/reload`), then pick an open-source model:
 This is the path to a working `/v1/models` listing on `http://localhost:8377`,
 which is what this extension needs.
 
-### 1. Install AntSeed
+Sources of truth for the commands below: the [`@antseed/cli`
+README](https://github.com/AntSeed/antseed/blob/main/apps/cli/README.md) and
+`antseed <cmd> --help`.
+
+### 1. Install the CLI
 
 ```bash
 npm i -g @antseed/cli
 antseed --version
 ```
 
-The published package is [`@antseed/cli`](https://www.npmjs.com/package/@antseed/cli);
-it installs the `antseed` binary. Identity / state lives in `~/.antseed/`.
+The binary is `antseed`. Identity and state live in `~/.antseed/`.
 
-First-time setup:
+### 2. Set your buyer identity
 
-```bash
-antseed seller setup   # creates ~/.antseed/config.json
-```
-
-### 2. Fund the buyer wallet
-
-`antseed buyer status` shows your wallet address. Either:
-
-- **Deposits** (pay-as-you-go): send USDC on Base to your wallet, then
-  `antseed buyer deposit 5` (deposits 5 USDC into the on-chain deposits
-  contract).
-- **Subscription** (flat rate): `antseed buyer subscribe join <tierId>`.
-
-Verify with `antseed buyer balance` and `antseed buyer subscribe status`.
-
-### 3. Start the buyer proxy
+AntSeed authenticates your node with a secp256k1 private key. Export it before
+running any buyer command:
 
 ```bash
-antseed buyer start
+export ANTSEED_IDENTITY_HEX=<your-private-key-hex>
 ```
 
-This opens the OpenAI-compatible proxy on the port from `~/.antseed/config.json`
-(`buyer.proxyPort`, default `8377`).
+(Persist it in your shell profile or a `.env.local` next to where you run
+`antseed`.)
 
-Sanity-check it:
+### 3. Fund the buyer with USDC on Base
+
+Launch the local payments portal and deposit USDC from any funded wallet
+(MetaMask, Coinbase Wallet, etc.):
+
+```bash
+antseed payments    # opens http://localhost:3118
+```
+
+The contract's `deposit(buyer, amount)` pulls USDC from the connected wallet
+and credits your node — your identity key never has to hold funds.
+
+Check balances any time:
+
+```bash
+antseed buyer balance
+antseed buyer status
+```
+
+### 4. Start the buyer proxy
+
+```bash
+antseed buyer start    # proxy on http://localhost:8377
+```
+
+Sanity-check that the OpenAI-compatible endpoint is up:
 
 ```bash
 curl -s http://localhost:8377/v1/models | jq
 ```
 
-> If you get an empty list, the buyer is up but isn't connected to any seller
-> yet — keep going.
+If the list is empty, the proxy is up but not connected to a seller — keep
+going.
 
-### 4. Find a peer (seller) to talk to
+### 5. Find a peer (seller) to talk to
 
-Browse the network for sellers and the services they offer:
-
-```bash
-antseed network browse --services
-antseed network browse --service claude-sonnet-4-5-20250929 --sort price
-```
-
-Pick a peer ID (40-char hex, e.g. `4668854ba3e8b094e6f48fbeb59cec1cfde162f2`)
-and inspect it:
+Browse what's on the network:
 
 ```bash
-antseed network peer <peerId>
+antseed network browse
+antseed network browse --services            # one row per (peer, service)
+antseed network browse --sort price --top 10
 ```
 
-### 5. Connect to that peer
-
-Two options:
-
-**a) Pin a single peer for the session** (what was done on this machine):
+Inspect a specific peer:
 
 ```bash
-antseed buyer connection set --peer <peerId>
+antseed peer <peerId>
 ```
 
-That's it. `curl http://localhost:8377/v1/models` should now list the peer's
-services, and pi can route requests through them.
+### 6. Connect to that peer
 
-To unpin later:
+While `antseed buyer start` is running, pin a peer for the session:
 
 ```bash
-antseed buyer connection clear
+antseed buyer connection set --peer <40-char-hex-peer-id>
 ```
 
-**b) Use a router plugin** — pass `--router <name>` (or `--instance <id>`) to
-`antseed buyer start` to let a configured router pick peers automatically. See
-`antseed buyer start --help`.
+Or pin a specific service (rewrites the `model` field on every request):
 
-### 6. Use it in pi
+```bash
+antseed buyer connection set --service <service-id>
+```
+
+State lives in `~/.antseed/buyer.state.json` and is picked up by the running
+proxy via file-watching. Inspect or clear:
+
+```bash
+antseed buyer connection get
+antseed buyer connection clear            # clear all
+antseed buyer connection clear --peer     # clear only the peer pin
+```
+
+Alternatively, start the proxy with a non-default router so peer selection is
+automatic:
+
+```bash
+antseed buyer start --router <name>
+```
+
+After pinning, `curl http://localhost:8377/v1/models` should now list the
+peer's services.
+
+### 7. Use it in pi
 
 ```
 /model antseed/minimax-m2.7
@@ -149,11 +173,14 @@ ANTSEED_MODELS="minimax-m2.7,minimax-m2.7-highspeed" pi
 - **`502 Bad Gateway` on `/v1/messages`** — expected; the proxy speaks Chat
   Completions, not the Anthropic API. pi uses `openai-completions` here.
 - **Empty `/v1/models`** — no peer is connected. Pin one with
-  `antseed buyer connection set --peer <id>` or configure a router.
+  `antseed buyer connection set --peer <id>`, or start the proxy with
+  `--router <name>`.
 - **`Connection state: idle` in `antseed buyer status`** — run
   `antseed buyer start` and keep it running.
-- **Insufficient deposits** — `antseed buyer balance` should be > 0, or you
-  need an active subscription.
+- **Insufficient deposits** — `antseed buyer balance` should be > 0; top up
+  via `antseed payments`.
+- **Identity errors** — make sure `ANTSEED_IDENTITY_HEX` is exported in the
+  shell that runs `antseed buyer start`.
 
 ---
 
