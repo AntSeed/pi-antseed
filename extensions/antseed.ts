@@ -6,10 +6,11 @@
  * Completions, and OpenAI Responses interchangeably via @antseed/api-adapter;
  * we point pi at Chat Completions because that's the hub format.
  *
- * Models are discovered at load time from the pinned peer's `/v1/models`
- * endpoint, so this extension stays accurate as you switch peers with
- * `antseed buyer connection set --peer <id>`. Reload pi (`/reload`) after
- * changing peers to refresh the list.
+ * A small built-in model seed list is registered synchronously so pi can honor
+ * `defaultProvider: "antseed"` / `defaultModel` during startup. The provider is
+ * then refreshed from the pinned peer's `/v1/models` endpoint, so this extension
+ * stays accurate as you switch peers with `antseed buyer connection set --peer
+ * <id>`. Reload pi (`/reload`) after changing peers to refresh the list.
  *
  * Prerequisites (see README.md):
  *   1. `antseed buyer start` is running.
@@ -74,17 +75,35 @@ async function fetchModelIds(): Promise<string[]> {
 	}
 }
 
-async function resolveModels(): Promise<ModelSpec[]> {
+function parseModelOverride(): string[] | undefined {
 	const override = process.env.ANTSEED_MODELS;
-	if (override) {
-		return override
-			.split(",")
-			.map((id) => id.trim())
-			.filter(Boolean)
-			.map(makeModel);
-	}
-	const ids = await fetchModelIds();
-	return ids.map(makeModel);
+	if (!override) return undefined;
+	return override
+		.split(",")
+		.map((id) => id.trim())
+		.filter(Boolean);
+}
+
+function mergeModelIds(...groups: Array<string[] | undefined>): string[] {
+	return [...new Set(groups.flatMap((group) => group ?? []))];
+}
+
+function initialModelIds(): string[] {
+	// Pi chooses the default model during startup. Provider registration that happens
+	// later from async discovery is too late for that first selection, so register a
+	// small synchronous seed list immediately. ANTSEED_MODELS can narrow/override it.
+	return parseModelOverride() ?? Object.keys(MODEL_HINTS);
+}
+
+async function resolveModels(): Promise<ModelSpec[]> {
+	const override = parseModelOverride();
+	if (override) return override.map(makeModel);
+
+	const discovered = await fetchModelIds();
+	// Keep the synchronous seed list available even if the current peer advertises a
+	// partial model list. Requests still go through AntSeed, which will validate
+	// whether the pinned peer/service can serve the requested model.
+	return mergeModelIds(initialModelIds(), discovered).map(makeModel);
 }
 
 function register(pi: ExtensionAPI, models: ModelSpec[]): void {
@@ -104,6 +123,11 @@ function register(pi: ExtensionAPI, models: ModelSpec[]): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Register synchronously so Pi can honor defaultProvider/defaultModel during
+	// startup. Without this, the provider may not exist yet when Pi picks the
+	// initial model, causing new chats to fall back to another provider (e.g. Opus).
+	register(pi, initialModelIds().map(makeModel));
+
 	(async () => {
 		try {
 			const models = await resolveModels();
