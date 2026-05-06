@@ -4,7 +4,12 @@
  * Registers the AntSeed local buyer proxy (default http://localhost:8377/v1)
  * as a model provider in pi. AntSeed exposes Anthropic Messages, OpenAI Chat
  * Completions, and OpenAI Responses interchangeably via @antseed/api-adapter;
- * we point pi at Chat Completions because that's the hub format.
+ * we point pi at the OpenAI Responses API because that's the only wire format
+ * that round-trips reasoning items losslessly. Chat-completions silently
+ * drops `reasoning` content between turns, which corrupts multi-turn sessions
+ * with Codex-backed reasoning models (gpt-5.5) — the upstream returns
+ * `response.failed` once the reasoning chain in `input` no longer matches
+ * what it expects, and the buyer sees a 200-OK SSE stream with no output.
  *
  * A small built-in model seed list is registered synchronously so pi can honor
  * `defaultProvider: "antseed"` / `defaultModel` during startup. The provider is
@@ -42,8 +47,8 @@ interface ModelSpec {
 // Hints for well-known model IDs the AntSeed network currently advertises.
 // Anything not listed falls back to safe text-only defaults.
 const MODEL_HINTS: Record<string, Partial<ModelSpec>> = {
-	"gpt-5.4": { input: ["text", "image"], contextWindow: 200_000, maxTokens: 16_384 },
-	"gpt-5.5": { input: ["text", "image"], reasoning: true, contextWindow: 200_000, maxTokens: 16_384 },
+	"gpt-5.4": { input: ["text", "image"], contextWindow: 400_000, maxTokens: 16_384 },
+	"gpt-5.5": { input: ["text", "image"], reasoning: true, contextWindow: 400_000, maxTokens: 16_384 },
 	"minimax-m2.5": { contextWindow: 128_000, maxTokens: 8_192 },
 	"minimax-m2.7": { reasoning: true, contextWindow: 128_000, maxTokens: 8_192 },
 	"minimax-m2.7-highspeed": { contextWindow: 128_000, maxTokens: 8_192 },
@@ -112,7 +117,7 @@ function register(pi: ExtensionAPI, models: ModelSpec[]): void {
 		// AntSeed doesn't require an API key on localhost. pi-ai still asks for
 		// one, so default to a literal placeholder unless the user supplies one.
 		apiKey: process.env.ANTSEED_API_KEY ? "ANTSEED_API_KEY" : "antseed-local",
-		api: "openai-completions",
+		api: "openai-responses",
 		authHeader: true,
 		models: models.map((m) => ({
 			...m,
