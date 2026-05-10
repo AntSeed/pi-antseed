@@ -2,13 +2,13 @@
 
 Use [AntSeed](https://antseed.com) as a model provider in [pi](https://shittycodingagent.ai).
 
-AntSeed runs a **local buyer proxy** (default `http://localhost:8377/v1`) that
+AntSeed runs a **local buyer proxy** (default `http://localhost:8377`) that
 speaks Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses
 interchangeably — the [`@antseed/api-adapter`](https://github.com/AntSeed/antseed/tree/main/packages/api-adapter)
 translates between them on the fly, regardless of what the upstream seller
-actually speaks. This package registers the proxy as a pi provider called
-`antseed` (using OpenAI Chat Completions), so you can switch to AntSeed-routed
-models with `/model antseed/<id>`.
+actually speaks. This package registers a protocol-aware pi provider named
+`antseed`, so you can switch to AntSeed-routed models with
+`/model antseed/<id>` without manually choosing the wire protocol.
 
 ---
 
@@ -25,18 +25,19 @@ pi -e git:github.com/AntSeed/pi-antseed
 pi install ./pi-antseed
 ```
 
-Restart pi (or `/reload`), then pick an open-source model:
+Restart pi (or `/reload`), then pick any discovered AntSeed service/peer route:
 
 ```
-/model antseed/minimax-m2.7
+/model antseed/<service-id>@<peer-prefix>
 ```
 
 ---
 
 ## Prerequisites — getting AntSeed wired up
 
-This is the path to a working `/v1/models` listing on `http://localhost:8377`,
-which is what this extension needs.
+This is the path to a running buyer proxy on `http://localhost:8377`. The
+extension reads `/_antseed/peers` from that proxy to learn each service's
+network-advertised API protocol.
 
 Sources of truth for the commands below: the [`@antseed/cli`
 README](https://github.com/AntSeed/antseed/blob/main/apps/cli/README.md) and
@@ -115,98 +116,94 @@ antseed network peer 0e49122e76bd8b9ccb2fe10c0088c41ceb608927
 
 (`antseed peer <peerId>` also exists for a quick profile-only view.)
 
-### 6. Connect to that peer
+### 6. Verify peers are visible to the proxy
 
-While `antseed buyer start` is running, pin a peer for the session:
-
-```bash
-antseed buyer connection set --peer <40-char-hex-peer-id>
-```
-
-Or pin a specific service (rewrites the `model` field on every request):
+The pi extension targets a peer per request, so you do **not** need to pin a
+session-wide peer with `antseed buyer connection set`. The proxy must simply see
+network peers:
 
 ```bash
-antseed buyer connection set --service <service-id>
+curl http://localhost:8377/_antseed/peers | jq
 ```
 
-State lives in `~/.antseed/buyer.state.json` and is picked up by the running
-proxy via file-watching. Inspect or clear:
-
-```bash
-antseed buyer connection get
-antseed buyer connection clear            # clear all
-antseed buyer connection clear --peer     # clear only the peer pin
-```
-
-Alternatively, start the proxy with a non-default router so peer selection is
-automatic:
-
-```bash
-antseed buyer start --router <name>
-```
-
-After pinning, `curl http://localhost:8377/v1/models` should now list the
-peer's services.
+The response should include `providerServiceApiProtocols` metadata for each
+service. The extension uses that metadata to register pi models and send the
+selected peer in the `x-antseed-pin-peer` request header.
 
 ### 7. Use it in pi
 
+Open the model selector with `Ctrl+L` (or `/model`) and pick any AntSeed route:
+
 ```
-/model antseed/minimax-m2.7
+antseed/<service-id>@<peer-prefix>[-<peer-name>][-rep<score>]
 ```
 
-MiniMax M2.7 is an open-weights model — a good default. The extension registers
-a small built-in seed list synchronously so pi can honor `defaultProvider` /
-`defaultModel` at startup, then refreshes from the pinned peer's `/v1/models`.
-Whatever that peer advertises shows up under `antseed/...` automatically. After
-changing peers with `antseed buyer connection set --peer <id>`, run `/reload` in
-pi to refresh.
+For example:
 
-If you want to bypass discovery (offline, or to register a specific subset),
-set `ANTSEED_MODELS`:
+```
+antseed/claude-opus-4-5@0e49122e76bd-acme-buyer-rep95
+antseed/arcee-trinity-thinking@0e49122e76bd-acme-buyer-rep95
+antseed/minimax-m2.7@bbbbbbbbbbbb-rep5
+```
+
+The extension reads AntSeed's peer metadata from `/_antseed/peers`, discovers
+each service/peer route, registers every route as a selectable pi model, and
+appends the peer's `displayName` (slugified) and `reputationScore` to the model
+id so they're visible directly in the pi selector. Routes are ordered by peer
+reputation, highest first. On each request, the extension sends the peer pin
+header (`x-antseed-pin-peer`) and lets the AntSeed proxy select the provider
+inside that peer.
+
+If you want to expose only a specific subset of the discovered services, set
+`ANTSEED_MODELS`:
 
 ```bash
-ANTSEED_MODELS="minimax-m2.7,minimax-m2.7-highspeed" pi
+ANTSEED_MODELS="minimax-m2.7,arcee-trinity-thinking" pi
 ```
+
+Matching is by service id or by full route id (e.g.
+`minimax-m2.7@bbbbbbbbbbbb-rep5`).
 
 ---
 
 ## Configuration
 
-| Env var            | Default                           | Purpose                                                   |
-| ------------------ | --------------------------------- | --------------------------------------------------------- |
-| `ANTSEED_BASE_URL` | `http://localhost:8377/v1`        | Override the buyer proxy URL.                             |
-| `ANTSEED_API_KEY`  | _(unset)_                         | Only needed if you front the proxy with auth.            |
-| `ANTSEED_MODELS`   | built-in seed list + `/v1/models` | Comma-separated model IDs to register, skips discovery.   |
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `ANTSEED_BASE_URL` | `http://localhost:8377` | Override the buyer proxy URL. Either the root URL or `/v1` URL is accepted; the extension normalizes it per protocol. |
+| `ANTSEED_API_KEY` | _(unset)_ | Only needed if you front the proxy with auth. |
+| `ANTSEED_MODELS` | all protocol-bearing services from `/_antseed/peers` | Optional comma-separated allow-list of service IDs or full `service@peer-prefix[-name][-rep<score>]` route IDs to register. |
 
 ---
 
 ## Troubleshooting
 
-- **Empty `/v1/models`** — no peer is connected. Pin one with
-  `antseed buyer connection set --peer <id>`, or start the proxy with
-  `--router <name>`.
+- **No `antseed/...` models in pi** — no protocol-bearing services were found
+  in `/_antseed/peers`. Make sure `antseed buyer start` is running, peers are
+  discoverable with `antseed network browse --services`, then run `/reload`.
 - **`Connection state: idle` in `antseed buyer status`** — run
   `antseed buyer start` and keep it running.
 - **Insufficient deposits** — `antseed buyer balance` should be > 0; top up
   via `antseed payments`.
 - **Identity errors** — make sure `ANTSEED_IDENTITY_HEX` is exported in the
   shell that runs `antseed buyer start`.
-- **5xx from the proxy on a real request** — usually means the pinned peer
-  doesn't offer the model you asked for, or has gone offline. Re-run
-  `antseed network browse --services` and pick another peer.
+- **5xx from the proxy on a real request** — usually means the selected peer
+  route has gone offline or no longer offers that service. Re-run
+  `antseed network browse --services`, `/reload`, and pick another route.
 
 ---
 
 ## How it works
 
-`extensions/antseed.ts` calls `pi.registerProvider("antseed", { ... })` with
-`api: "openai-completions"` and `authHeader: true`, pointing at the local
-AntSeed buyer proxy. Pi then treats AntSeed like any other OpenAI-compatible
-provider; AntSeed handles peer selection, payment channels, and metering on its
-side.
+`extensions/antseed.ts` registers one provider, `antseed`, with a tiny custom
+`streamSimple` dispatcher. At `/reload`, it reads `/_antseed/peers`, builds a
+route map from `providerServiceApiProtocols`, and registers each
+service/peer pair as a pi model. On each request, it sends
+`x-antseed-pin-peer: <peerId>`, chooses the correct pi-ai provider for that
+service protocol, and uses the correct base URL shape:
 
-We pick OpenAI Chat Completions because it's the hub format inside
-`@antseed/api-adapter` — every supported protocol routes through it, so
-pointing pi at `/v1/chat/completions` is the most direct path. The same proxy
-will happily serve `/v1/messages` (Anthropic) or `/v1/responses` (OpenAI
-Responses) for other tools that prefer those shapes.
+- `anthropic-messages` → proxy root (`http://localhost:8377`) because pi appends `/v1/messages`.
+- `openai-responses` / `openai-chat-completions` → OpenAI base (`http://localhost:8377/v1`).
+
+AntSeed still handles the selected peer connection, payment channels, provider
+selection inside that peer, protocol adaptation, and metering on its side.

@@ -1,39 +1,38 @@
 /**
  * pi-antseed
  *
- * Registers the AntSeed local buyer proxy (default http://localhost:8377/v1)
- * as a model provider in pi. AntSeed exposes Anthropic Messages, OpenAI Chat
- * Completions, and OpenAI Responses interchangeably via @antseed/api-adapter;
- * we point pi at the OpenAI Responses API because that's the only wire format
- * that round-trips reasoning items losslessly. Chat-completions silently
- * drops `reasoning` content between turns, which corrupts multi-turn sessions
- * with Codex-backed reasoning models (gpt-5.5) — the upstream returns
- * `response.failed` once the reasoning chain in `input` no longer matches
- * what it expects, and the buyer sees a 200-OK SSE stream with no output.
+ * Registers the AntSeed local buyer proxy (default http://localhost:8377) as a
+ * protocol-aware pi provider. The extension reads AntSeed peer metadata from
+ * `/_antseed/peers`, discovers which API protocol each service advertises, and
+ * dispatches each request through the matching pi-ai provider implementation.
  *
- * A small built-in model seed list is registered synchronously so pi can honor
- * `defaultProvider: "antseed"` / `defaultModel` during startup. The provider is
- * then refreshed from the pinned peer's `/v1/models` endpoint, so this extension
- * stays accurate as you switch peers with `antseed buyer connection set --peer
- * <id>`. Reload pi (`/reload`) after changing peers to refresh the list.
+ * Reputation is sourced from the buyer's local state file (default
+ * `~/.antseed/buyer.state.json`) because the HTTP `/_antseed/peers` payload
+ * omits `onChainReputationScore`. See `apps/cli/src/proxy/buyer-proxy.ts`
+ * (`_persistPeersToState` writes it; `_handleControlPlane` does not surface
+ * it on the wire).
  *
- * Prerequisites (see README.md):
- *   1. `antseed buyer start` is running.
- *   2. ANTSEED_IDENTITY_HEX exported and deposits funded via `antseed payments`.
- *   3. A peer is pinned (`antseed buyer connection set --peer <id>`) or a
- *      router plugin is configured.
- *
- * Configuration (env):
- *   ANTSEED_BASE_URL  override the proxy URL (default http://localhost:8377/v1)
- *   ANTSEED_API_KEY   only needed if you put auth in front of the proxy
- *   ANTSEED_MODELS    comma-separated model IDs to use instead of `/v1/models`
- *                     discovery (e.g. "minimax-m2.7,gpt-5.5")
+ * Configuration:
+ *   ANTSEED_BASE_URL          proxy root or /v1 URL (default http://localhost:8377)
+ *   ANTSEED_API_KEY           only needed if you put auth in front of the proxy
+ *   ANTSEED_MODELS            optional comma-separated allow-list of service IDs
+ *   ANTSEED_DATA_DIR          directory holding buyer.state.json (default ~/.antseed)
+ *   ANTSEED_BUYER_STATE_FILE  explicit path to buyer.state.json (overrides ANTSEED_DATA_DIR)
  */
+import type { ExtensionAPI, ProviderModelConfig } from "@mariozechner/pi-coding-agent";
+import { getApiProvider, type Api, type Context, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+type AntseedApi = Extract<Api, "anthropic-messages" | "openai-completions" | "openai-responses">;
+type AntseedNetworkProtocol = AntseedApi | "openai-chat-completions";
+type AntseedAutoApi = "antseed-network";
 
-const BASE_URL = process.env.ANTSEED_BASE_URL ?? "http://localhost:8377/v1";
+const AUTO_API: AntseedAutoApi = "antseed-network";
+const BASE_URL = process.env.ANTSEED_BASE_URL ?? "http://localhost:8377";
 const DISCOVERY_TIMEOUT_MS = 4000;
+const PIN_PEER_HEADER = "x-antseed-pin-peer";
 
 interface ModelSpec {
 	id: string;
@@ -44,112 +43,418 @@ interface ModelSpec {
 	maxTokens: number;
 }
 
-// Hints for well-known model IDs the AntSeed network currently advertises.
-// Anything not listed falls back to safe text-only defaults.
-const MODEL_HINTS: Record<string, Partial<ModelSpec>> = {
-	"gpt-5.4": { input: ["text", "image"], contextWindow: 400_000, maxTokens: 16_384 },
-	"gpt-5.5": { input: ["text", "image"], reasoning: true, contextWindow: 400_000, maxTokens: 16_384 },
-	"minimax-m2.5": { contextWindow: 128_000, maxTokens: 8_192 },
-	"minimax-m2.7": { reasoning: true, contextWindow: 128_000, maxTokens: 8_192 },
-	"minimax-m2.7-highspeed": { contextWindow: 128_000, maxTokens: 8_192 },
-};
+interface PeerRecord {
+	peerId?: unknown;
+	displayName?: unknown;
+	providerServiceApiProtocols?: unknown;
+	providerServiceCategories?: unknown;
+	// AntSeed exposes two reputation numbers on each peer:
+	//   onChainReputationScore — derived from on-chain receipts (canonical)
+	//   reputationScore        — locally tracked / off-chain fallback
+	// Match the convention used in @antseed/router-core's peer-scorer:
+	// prefer on-chain when present, fall back to off-chain.
+	onChainReputationScore?: unknown;
+	reputationScore?: unknown;
+}
 
-function makeModel(id: string): ModelSpec {
-	const hint = MODEL_HINTS[id] ?? {};
+interface AntseedRoute {
+	api: AntseedApi;
+	peerId: string;
+	peerName: string | null;
+	serviceId: string;
+	reputation: number;
+	categories: Set<string>;
+}
+
+const DEFAULT_CONTEXT_WINDOW = 400_000;
+const DEFAULT_MAX_TOKENS = 16_384;
+
+let modelRoutes = new Map<string, AntseedRoute>();
+// peerId (lowercased) → effective reputation, sourced from buyer.state.json.
+// Populated once per discovery cycle in discoverModels().
+let buyerStateReputations = new Map<string, number>();
+
+function stripTrailingSlashes(url: string): string {
+	return url.replace(/\/+$/, "");
+}
+
+function proxyRootUrl(): string {
+	return stripTrailingSlashes(BASE_URL.trim() || "http://localhost:8377").replace(/\/v1$/i, "");
+}
+
+function openAiBaseUrl(): string {
+	return `${proxyRootUrl()}/v1`;
+}
+
+function baseUrlForApi(api: AntseedApi): string {
+	return api === "anthropic-messages" ? proxyRootUrl() : openAiBaseUrl();
+}
+
+function peersUrl(): string {
+	return `${proxyRootUrl()}/_antseed/peers`;
+}
+
+function serviceKey(service: string): string {
+	return service.trim().toLowerCase();
+}
+
+function makeModel(id: string, route: AntseedRoute): ModelSpec {
 	return {
 		id,
-		name: hint.name ?? `${id} (AntSeed)`,
-		reasoning: hint.reasoning ?? false,
-		input: hint.input ?? ["text"],
-		contextWindow: hint.contextWindow ?? 128_000,
-		maxTokens: hint.maxTokens ?? 8_192,
+		name: routeDisplayName(route),
+		reasoning: supportsReasoning(route),
+		input: supportsImages(route) ? ["text", "image"] : ["text"],
+		contextWindow: inferContextWindow(route.serviceId),
+		maxTokens: DEFAULT_MAX_TOKENS,
 	};
 }
 
-async function fetchModelIds(): Promise<string[]> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), DISCOVERY_TIMEOUT_MS);
-	try {
-		const res = await fetch(`${BASE_URL}/models`, { signal: controller.signal });
-		if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-		const body = (await res.json()) as { data?: Array<{ id?: string }> };
-		const ids = (body.data ?? []).map((m) => m.id).filter((id): id is string => typeof id === "string" && id.length > 0);
-		return ids;
-	} finally {
-		clearTimeout(timer);
+function routeDisplayName(route: AntseedRoute): string {
+	const peerLabel = route.peerName
+		? `${route.peerName} (${route.peerId.slice(0, 8)})`
+		: route.peerId.slice(0, 12);
+	const rep = Number.isFinite(route.reputation) ? ` · rep ${displayReputation(route.reputation)}` : "";
+	return `${route.serviceId} @ ${peerLabel}${rep} (AntSeed)`;
+}
+
+function displayReputation(score: number): number {
+	// Buyer-state on-chain scores are floats (e.g. 78.86273751647683). Round to
+	// an integer so model ids and display names stay readable.
+	return Math.round(score);
+}
+
+function supportsReasoning(route: AntseedRoute): boolean {
+	return route.api !== "openai-completions" && hasAnyCategory(route, ["reasoning", "thinking"]);
+}
+
+function supportsImages(route: AntseedRoute): boolean {
+	return hasAnyCategory(route, ["multimodal", "vision", "image", "images"]);
+}
+
+function hasAnyCategory(route: AntseedRoute, categories: string[]): boolean {
+	return categories.some((category) => route.categories.has(category));
+}
+
+function inferContextWindow(id: string): number {
+	const match = id.toLowerCase().match(/(?:^|[-_.])(\d+(?:\.\d+)?)([km])(?:$|[-_.])/);
+	if (!match) return DEFAULT_CONTEXT_WINDOW;
+
+	const value = Number(match[1]);
+	if (!Number.isFinite(value) || value <= 0) return DEFAULT_CONTEXT_WINDOW;
+	return Math.round(value * (match[2] === "m" ? 1_000_000 : 1_000));
+}
+
+function toProviderModel(model: ModelSpec): ProviderModelConfig {
+	return {
+		...model,
+		api: AUTO_API,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function isNetworkProtocol(value: unknown): value is AntseedNetworkProtocol {
+	return value === "anthropic-messages"
+		|| value === "openai-responses"
+		|| value === "openai-chat-completions"
+		|| value === "openai-completions";
+}
+
+function toPiApi(protocol: AntseedNetworkProtocol): AntseedApi {
+	return protocol === "openai-chat-completions" ? "openai-completions" : protocol;
+}
+
+function chooseApi(protocols: unknown[]): AntseedApi | null {
+	const supported = protocols.filter(isNetworkProtocol);
+	if (supported.length === 0) return null;
+
+	// Prefer lossless/stateful protocols when a seller advertises multiple options.
+	for (const protocol of ["openai-responses", "anthropic-messages", "openai-chat-completions", "openai-completions"] as const) {
+		if (supported.includes(protocol)) return toPiApi(protocol);
+	}
+	return toPiApi(supported[0]!);
+}
+
+const PEER_ID_PREFIX_LENGTH = 12;
+const PEER_NAME_SLUG_MAX = 24;
+
+function slugifyPeerName(name: string): string {
+	return name
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, PEER_NAME_SLUG_MAX);
+}
+
+function routeModelId(service: string, peerId: string, peerName: string | null, reputation: number): string {
+	const slug = peerName ? slugifyPeerName(peerName) : "";
+	const slugSegment = slug ? `-${slug}` : "";
+	const repSegment = Number.isFinite(reputation) ? `-rep${displayReputation(reputation)}` : "";
+	return `${service}@${peerId.slice(0, PEER_ID_PREFIX_LENGTH)}${slugSegment}${repSegment}`;
+}
+
+function setRoute(
+	routes: Map<string, AntseedRoute>,
+	peerId: string,
+	peerName: string | null,
+	service: string,
+	api: AntseedApi,
+	reputation: number,
+	categories: Set<string>,
+): void {
+	const key = serviceKey(routeModelId(service, peerId, peerName, reputation));
+	const existing = routes.get(key);
+	if (!existing) {
+		routes.set(key, { api, peerId, peerName, serviceId: service, reputation, categories });
+		return;
+	}
+
+	for (const category of categories) existing.categories.add(category);
+	if (routeRank(api) < routeRank(existing.api)) {
+		existing.api = api;
 	}
 }
 
-function parseModelOverride(): string[] | undefined {
-	const override = process.env.ANTSEED_MODELS;
-	if (!override) return undefined;
-	return override
-		.split(",")
-		.map((id) => id.trim())
-		.filter(Boolean);
+function routeRank(api: AntseedApi): number {
+	if (api === "openai-responses") return 0;
+	if (api === "anthropic-messages") return 1;
+	return 2;
 }
 
-function mergeModelIds(...groups: Array<string[] | undefined>): string[] {
-	return [...new Set(groups.flatMap((group) => group ?? []))];
+function peerReputation(peer: PeerRecord, peerId: string): number {
+	// Precedence:
+	//   1. buyer.state.json (canonical: contains the real onChainReputationScore
+	//      that the buyer-proxy computed locally — the HTTP /_antseed/peers
+	//      payload deliberately omits it).
+	//   2. peer.onChainReputationScore from the HTTP payload (in case a future
+	//      buyer-proxy revision starts surfacing it).
+	//   3. peer.reputationScore (off-chain fallback).
+	//   4. NEGATIVE_INFINITY — pushes unrated peers to the bottom.
+	const fromState = buyerStateReputations.get(peerId);
+	if (typeof fromState === "number" && Number.isFinite(fromState)) {
+		return fromState;
+	}
+	if (typeof peer.onChainReputationScore === "number" && Number.isFinite(peer.onChainReputationScore)) {
+		return peer.onChainReputationScore;
+	}
+	if (typeof peer.reputationScore === "number" && Number.isFinite(peer.reputationScore)) {
+		return peer.reputationScore;
+	}
+	return Number.NEGATIVE_INFINITY;
 }
 
-function initialModelIds(): string[] {
-	// Pi chooses the default model during startup. Provider registration that happens
-	// later from async discovery is too late for that first selection, so register a
-	// small synchronous seed list immediately. ANTSEED_MODELS can narrow/override it.
-	return parseModelOverride() ?? Object.keys(MODEL_HINTS);
+function peerDisplayName(peer: PeerRecord): string | null {
+	if (typeof peer.displayName !== "string") return null;
+	const trimmed = peer.displayName.trim();
+	return trimmed.length > 0 ? trimmed : null;
 }
 
-async function resolveModels(): Promise<ModelSpec[]> {
-	const override = parseModelOverride();
-	if (override) return override.map(makeModel);
+function collectRoutes(peer: PeerRecord, routes: Map<string, AntseedRoute>): void {
+	const peerId = typeof peer.peerId === "string" ? peer.peerId.trim().toLowerCase() : "";
+	if (!/^[0-9a-f]{40}$/.test(peerId)) return;
 
-	const discovered = await fetchModelIds();
-	// Keep the synchronous seed list available even if the current peer advertises a
-	// partial model list. Requests still go through AntSeed, which will validate
-	// whether the pinned peer/service can serve the requested model.
-	return mergeModelIds(initialModelIds(), discovered).map(makeModel);
+	const matrix = asRecord(peer.providerServiceApiProtocols);
+	if (!matrix) return;
+
+	const reputation = peerReputation(peer, peerId);
+	const peerName = peerDisplayName(peer);
+
+	for (const [provider, rawEntry] of Object.entries(matrix)) {
+		const services = asRecord(asRecord(rawEntry)?.services);
+		if (!services) continue;
+
+		for (const [service, rawProtocols] of Object.entries(services)) {
+			if (!Array.isArray(rawProtocols)) continue;
+			const api = chooseApi(rawProtocols);
+			if (api) setRoute(routes, peerId, peerName, service, api, reputation, serviceCategories(peer, provider, service));
+		}
+	}
 }
 
-function register(pi: ExtensionAPI, models: ModelSpec[]): void {
-	pi.registerProvider("antseed", {
-		baseUrl: BASE_URL,
-		// AntSeed doesn't require an API key on localhost. pi-ai still asks for
-		// one, so default to a literal placeholder unless the user supplies one.
-		apiKey: process.env.ANTSEED_API_KEY ? "ANTSEED_API_KEY" : "antseed-local",
-		api: "openai-responses",
-		authHeader: true,
-		models: models.map((m) => ({
-			...m,
-			// Pricing is metered per peer/service by AntSeed itself, not pi.
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		})),
+function serviceCategories(peer: PeerRecord, provider: string, service: string): Set<string> {
+	const categories = asRecord(asRecord(peer.providerServiceCategories)?.[provider])?.services;
+	const raw = asRecord(categories)?.[service];
+	return new Set(
+		Array.isArray(raw)
+			? raw.filter((category): category is string => typeof category === "string").map((category) => category.trim().toLowerCase()).filter(Boolean)
+			: [],
+	);
+}
+
+async function fetchJson(url: string): Promise<unknown> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), DISCOVERY_TIMEOUT_MS);
+	try {
+		const response = await fetch(url, { signal: controller.signal });
+		if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+		return await response.json();
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function buyerStateFilePath(): string {
+	const explicit = process.env.ANTSEED_BUYER_STATE_FILE?.trim();
+	if (explicit) return explicit;
+	const dataDir = process.env.ANTSEED_DATA_DIR?.trim() || join(homedir(), ".antseed");
+	return join(dataDir, "buyer.state.json");
+}
+
+async function loadBuyerStateReputations(): Promise<Map<string, number>> {
+	// Best-effort: if the file is missing or unreadable (e.g. extension is
+	// pointed at a remote proxy with no local state), return empty and let the
+	// HTTP payload supply whatever it has.
+	const path = buyerStateFilePath();
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf-8");
+	} catch {
+		return new Map();
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err) {
+		console.warn(`[pi-antseed] Failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`);
+		return new Map();
+	}
+
+	const peers = Array.isArray(asRecord(parsed)?.discoveredPeers)
+		? (asRecord(parsed)!.discoveredPeers as unknown[])
+		: [];
+
+	const map = new Map<string, number>();
+	for (const entry of peers) {
+		const record = asRecord(entry);
+		if (!record) continue;
+		const peerId = typeof record.peerId === "string" ? record.peerId.trim().toLowerCase() : "";
+		if (!/^[0-9a-f]{40}$/.test(peerId)) continue;
+
+		// Mirror the precedence used by @antseed/router-core's peer-scorer:
+		// on-chain wins, off-chain fallback. We don't run
+		// computeOnChainReputationScore() here — the buyer-proxy already
+		// persisted the result in onChainReputationScore.
+		const onChain = record.onChainReputationScore;
+		if (typeof onChain === "number" && Number.isFinite(onChain)) {
+			map.set(peerId, onChain);
+			continue;
+		}
+		const off = record.reputationScore;
+		if (typeof off === "number" && Number.isFinite(off)) {
+			map.set(peerId, off);
+		}
+	}
+	return map;
+}
+
+async function fetchNetworkRoutes(): Promise<Map<string, AntseedRoute>> {
+	const body = asRecord(await fetchJson(peersUrl()));
+	const peers = Array.isArray(body?.peers) ? body.peers as PeerRecord[] : [];
+	const routes = new Map<string, AntseedRoute>();
+
+	for (const peer of peers) {
+		collectRoutes(peer, routes);
+	}
+	return routes;
+}
+
+function configuredModelAllowList(): Set<string> | null {
+	const raw = process.env.ANTSEED_MODELS;
+	if (!raw) return null;
+	return new Set(raw.split(",").map((id) => serviceKey(id)).filter(Boolean));
+}
+
+async function discoverModels(): Promise<ModelSpec[]> {
+	// Refresh reputation map BEFORE collecting routes — collectRoutes ->
+	// peerReputation reads buyerStateReputations during route construction.
+	buyerStateReputations = await loadBuyerStateReputations();
+	const routes = await fetchNetworkRoutes();
+	const allowList = configuredModelAllowList();
+	if (allowList) {
+		for (const [key, route] of [...routes.entries()]) {
+			if (!allowList.has(key) && !allowList.has(serviceKey(route.serviceId))) routes.delete(key);
+		}
+	}
+
+	modelRoutes = routes;
+	return sortRoutesByReputation([...routes.entries()]).map(([id, route]) => makeModel(id, route));
+}
+
+function sortRoutesByReputation(entries: [string, AntseedRoute][]): [string, AntseedRoute][] {
+	// Primary: reputation descending (highest first; unknown rep falls to the bottom).
+	// Secondary: keep all of a peer's services together so the list reads as
+	//   <peer>
+	//     service A
+	//     service B
+	//   <next peer>
+	//     ...
+	// Tertiary: alphabetic service id within a peer.
+	return entries.sort(([, a], [, b]) => {
+		if (a.reputation !== b.reputation) return b.reputation - a.reputation;
+		const peerLabelA = a.peerName ?? a.peerId;
+		const peerLabelB = b.peerName ?? b.peerId;
+		if (peerLabelA !== peerLabelB) return peerLabelA.localeCompare(peerLabelB);
+		return a.serviceId.localeCompare(b.serviceId);
 	});
 }
 
-export default function (pi: ExtensionAPI) {
-	// Register synchronously so Pi can honor defaultProvider/defaultModel during
-	// startup. Without this, the provider may not exist yet when Pi picks the
-	// initial model, causing new chats to fall back to another provider (e.g. Opus).
-	register(pi, initialModelIds().map(makeModel));
+function routeForModel(id: string): AntseedRoute {
+	const route = modelRoutes.get(serviceKey(id));
+	if (!route) {
+		throw new Error(`[pi-antseed] No AntSeed route found for model ${id}. Run /reload to refresh network metadata.`);
+	}
+	return route;
+}
 
-	(async () => {
-		try {
-			const models = await resolveModels();
-			if (models.length === 0) {
-				console.warn(
-					"[pi-antseed] No models advertised by the AntSeed proxy. Pin a peer with " +
-						"`antseed buyer connection set --peer <id>` and run `/reload`.",
-				);
-				return;
-			}
-			register(pi, models);
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			console.warn(
-				`[pi-antseed] Failed to discover models from ${BASE_URL}/models: ${message}. ` +
-					"Make sure `antseed buyer start` is running, then `/reload`.",
-			);
+function routedModel<TApi extends AntseedApi>(model: Model<Api>, route: AntseedRoute): Model<TApi> {
+	return {
+		...model,
+		id: route.serviceId,
+		api: route.api,
+		baseUrl: baseUrlForApi(route.api),
+		reasoning: route.api === "openai-completions" ? false : model.reasoning,
+	} as Model<TApi>;
+}
+
+function routedOptions(route: AntseedRoute, options?: SimpleStreamOptions): SimpleStreamOptions {
+	return {
+		...options,
+		headers: {
+			...options?.headers,
+			[PIN_PEER_HEADER]: route.peerId,
+		},
+	};
+}
+
+function streamAntseed(model: Model<Api>, context: Context, options?: SimpleStreamOptions) {
+	const route = routeForModel(model.id);
+	const provider = getApiProvider(route.api);
+	if (!provider) throw new Error(`[pi-antseed] No pi-ai provider registered for API ${route.api}`);
+	return provider.streamSimple(routedModel(model, route), context, routedOptions(route, options));
+}
+
+export default async function (pi: ExtensionAPI) {
+	try {
+		const models = await discoverModels();
+		if (models.length === 0) {
+			console.warn("[pi-antseed] No protocol-bearing services found in /_antseed/peers. Start the buyer proxy, wait for peers, and run `/reload`.");
+			return;
 		}
-	})();
+
+		pi.registerProvider("antseed", {
+			baseUrl: proxyRootUrl(),
+			apiKey: process.env.ANTSEED_API_KEY ? "ANTSEED_API_KEY" : "antseed-local",
+			api: AUTO_API,
+			streamSimple: streamAntseed,
+			authHeader: true,
+			models: models.map(toProviderModel),
+		});
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.warn(`[pi-antseed] Failed to read AntSeed network metadata from ${peersUrl()}: ${message}`);
+	}
 }
